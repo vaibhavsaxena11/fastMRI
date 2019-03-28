@@ -137,7 +137,7 @@ def create_data_loaders(args):
     return train_loader, dev_loader, display_loader
 
 
-def train_epoch(args, epoch, model, data_loader, optimizer, writer):
+def train_epoch(args, epoch, model, model_disc, data_loader, optimizer_G, optimizer_D, writer):
     model.train()
     avg_loss = 0.
     start_epoch = start_iter = time.perf_counter()
@@ -147,11 +147,21 @@ def train_epoch(args, epoch, model, data_loader, optimizer, writer):
         input = input.unsqueeze(1).to(args.device)
         target = target.to(args.device)
 
-        output = model(input).squeeze(1)
-        loss = F.l1_loss(output, target)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # output = model(input).squeeze(1)
+        # loss = F.l1_loss(output, target)
+
+        loss_D_real = model_disc(target) # convert to loss
+        loss_D_fake = model_disc(model(input)) # convert to loss
+        loss_D = loss_D_real + loss_D_fake
+        loss_G = model(input) # convert to loss
+
+        optimizer_G.zero_grad()
+        loss_G.backward()
+        optimizer_G.step()
+
+        optimizer_D.zero_grad()
+        loss_D.backward()
+        optimizer_D.step()
 
         avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if iter > 0 else loss.item()
         writer.add_scalar('TrainLoss', loss.item(), global_step + iter)
@@ -210,13 +220,15 @@ def visualize(args, epoch, model, data_loader, writer):
             break
 
 
-def save_model(args, exp_dir, epoch, model, optimizer, best_dev_loss, is_new_best):
+def save_model(args, exp_dir, epoch, model, model_disc, optimizer_G, optimizer_D, best_dev_loss, is_new_best):
     torch.save(
         {
             'epoch': epoch,
             'args': args,
             'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
+            'model_disc': model_disc.state_dict(),
+            'optimizer_G': optimizer_G.state_dict(),
+            'optimizer_D': optimizer_D.state_dict(),
             'best_dev_loss': best_dev_loss,
             'exp_dir': exp_dir
         },
@@ -234,20 +246,26 @@ def build_model(args):
         num_pool_layers=args.num_pools,
         drop_prob=args.drop_prob
     ).to(args.device)
-    return model
+
+    model_disc = DiscModel(
+
+    ).to(args.device) # add model params here depending on unet_model.py
+    return model, model_disc
 
 
 def load_model(checkpoint_file):
     checkpoint = torch.load(checkpoint_file)
     args = checkpoint['args']
-    model = build_model(args)
+    # model = build_model(args)
+    model, model_disc = build_model(args)
     if args.data_parallel:
         model = torch.nn.DataParallel(model)
     model.load_state_dict(checkpoint['model'])
 
-    optimizer = build_optim(args, model.parameters())
-    optimizer.load_state_dict(checkpoint['optimizer'])
-    return checkpoint, model, optimizer
+    optimizer_G = build_optim(args, model.parameters())
+    # optimizer.load_state_dict(checkpoint['optimizer']) # uncomment after the first run, rather get from loader
+    optimizer_D = build_optim(args, model_disc.parameters()) # D's optimizer
+    return checkpoint, model, model_disc, optimizer_G, optimizer_D
 
 
 def build_optim(args, params):
@@ -260,33 +278,34 @@ def main(args):
     writer = SummaryWriter(log_dir=args.exp_dir / 'summary')
 
     if args.resume:
-        checkpoint, model, optimizer = load_model(args.checkpoint)
+        checkpoint, model, model_disc, optimizer_G, optimizer_D = load_model(args.checkpoint)
         args = checkpoint['args']
         best_dev_loss = checkpoint['best_dev_loss']
         start_epoch = checkpoint['epoch']
         del checkpoint
     else:
-        model = build_model(args)
+        model, model_disc = build_model(args)
         if args.data_parallel:
             model = torch.nn.DataParallel(model)
-        optimizer = build_optim(args, model.parameters())
+        optimizer_G = build_optim(args, model.parameters())
+        optimizer_D = build_optim(args, model_disc.params())
         best_dev_loss = 1e9
         start_epoch = 0
     logging.info(args)
     logging.info(model)
 
     train_loader, dev_loader, display_loader = create_data_loaders(args)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step_size, args.lr_gamma)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer_G, args.lr_step_size, args.lr_gamma)
 
     for epoch in range(start_epoch, args.num_epochs):
         scheduler.step(epoch)
-        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, writer)
+        train_loss, train_time = train_epoch(args, epoch, model, model_disc, train_loader, optimizer_G, optimizer_D, writer)
         dev_loss, dev_time = evaluate(args, epoch, model, dev_loader, writer)
         visualize(args, epoch, model, display_loader, writer)
 
         is_new_best = dev_loss < best_dev_loss
         best_dev_loss = min(best_dev_loss, dev_loss)
-        save_model(args, args.exp_dir, epoch, model, optimizer, best_dev_loss, is_new_best)
+        save_model(args, args.exp_dir, epoch, model, model_disc, optimizer_G, optimizer_D, best_dev_loss, is_new_best)
         logging.info(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
             f'DevLoss = {dev_loss:.4g} TrainTime = {train_time:.4f}s DevTime = {dev_time:.4f}s',

@@ -124,3 +124,13 @@ class UnetModel(nn.Module):
             output = torch.cat([output, stack.pop()], dim=1)
             output = layer(output)
         return self.conv2(output)
+
+class DiscModel(nn.Module):
+    ## architecture of the discriminator goes here
+    def __init__():
+        super().__init__()
+
+    def forward():
+
+        return
+    
